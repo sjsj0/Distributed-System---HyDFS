@@ -1,3 +1,4 @@
+````markdown
 # Hybrid Distributed File System (HyDFS)
 
 ## Overview
@@ -12,25 +13,50 @@ HyDFS is a distributed systems project implementing group membership, failure de
 ## Directory Structure
 
 ```
-src/                   # Source code
-  pkg/
-    memberd/           # Main membership daemon
-    protocol/          # Gossip and ping/ack protocols
-    store/             # Membership store
-    suspicion/         # Failure suspicion manager
-    transport/         # UDP transport layer
-    utils/             # Utility functions
-    wire/              # Wire protocol and encoding
-  go.mod               # Go module file
-
-setup/                 # Scripts for VM setup and orchestration
-  setup.bash           # Local setup script
-  vm_setup.bash        # VM setup automation
-  start_server.bash    # Start membership server
-  kill.bash            # Kill all running processes
-
-config.json            # System configuration file
-README.md              # Project documentation
+config.json
+README.md
+setup/
+  setup.bash
+  vm_setup.bash
+  start_server.bash
+  kill.bash
+src/
+  go.mod
+  config/
+    config.go
+  ctl/
+    hydfsctl_daemon.go
+  hydfs/
+    cmd/
+      hydfsd/
+        hydfs_daemon.go
+      server/
+        http_server.go
+    logging/
+      logger.go
+    merge/
+      ring/
+        replica_manager.go
+        ring_manager.go
+        ring.go
+    routing/
+      router.go
+    storage/
+      utils/
+  main/
+    main.go
+  membership/
+    daemon/
+      daemon.go
+      config_diff.go
+    node/
+      nodeid.go
+    protocol/
+      store/
+    suspicion/
+    transport/
+    wire/
+  utils/
 ```
 
 
@@ -172,3 +198,83 @@ These endpoints allow you to query and modify the system state, view membership 
 ## Contributing
 
 Contributions are welcome!
+
+````
+
+# HyDFS: extended module overview
+
+This companion file contains a concise tour of the HyDFS (file storage) components that complement the existing membership README in `README.md`.
+
+## HyDFSDaemon
+- Location: `src/ctl/hydfsctl_daemon.go` (and related command packages under `src/hydfs/cmd/`)
+- Responsibility: boots the HyDFS node, starts the HTTP server, subscribes to the membership store, and wires the ring manager + router. The daemon constructs a `FileStore`, `Ring.Manager` (if a membership store is available) and an HTTP API that exposes user-facing and replica endpoints.
+
+## HTTP API / Server
+- Location: `src/hydfs/cmd/server/http_server.go`
+- Responsibility: exposes the user-facing endpoints and replica endpoints used for file create/append/get. Key user endpoints:
+  - `POST /v1/user/create_with_data` — create a HyDFS file (streams file bytes)
+  - `POST /v1/user/append` — append bytes to a HyDFS file
+  - `GET  /v1/user/files/content` — download a file to a local path (uses manifest quorum to choose replica)
+
+  Replica (node→node) endpoints are used during replication and reads:
+  - `POST /v1/replica/create_with_data`, `POST /v1/replica/append`, `GET /v1/replica/files/content`, `GET /v1/replica/files/manifest`.
+
+  The server implements multipart responses for replica reads (file bytes + JSON metadata) and performs quorum-based fetches when serving user GETs.
+
+## Storage (chunks, manifest, file store)
+- Location: `src/hydfs/storage/` (files: `chunk_store.go`, `file_store.go`, `manifest.go`, etc.)
+- Responsibilities:
+  - Chunking: large uploads are split into chunk files (max chunk size = 64 MB). See `WriteChunks`/`ReadChunks` in `chunk_store.go`.
+  - Manifest model: each HyDFS file has a manifest (versioned list of append operations). The manifest contains `AppendOp` records and deterministic ordering/merge rules.
+  - FileStore: manages creating files, appending data (writes chunks, updates manifest), and reading by concatenating chunks. It also exposes helpers to create local files from stored data.
+
+## Ring & Replica Management
+- Location: `src/hydfs/ring/` (e.g., `ring_manager.go`) and `src/hydfs/ring/replica_manager.go`
+- Responsibility: maintain the consistent-hashing ring built from the membership store, plan local rebalancing (pushes and garbage-collection), and (optionally) execute moves using an HTTP mover when the ring changes. The ring manager subscribes to membership updates and rebuilds the ring automatically.
+
+## Routing
+- Location: `src/hydfs/routing/router.go`
+- Responsibility: translate a HyDFS filename into a replica set by computing a file token and selecting successors on the ring. This encapsulates the replication factor used by the system.
+
+## Merge & Conflict Ordering
+- Location: `src/hydfs/merge/merge.go`
+- Responsibility: provide deterministic ordering of append operations (SortOps) using timestamps, client IDs, and client sequence numbers so manifests converge across replicas.
+
+## Logging
+- Location: `src/hydfs/logging/logger.go`
+- Responsibility: node-local structured logging for file operations (RECV / DONE / INFO messages) written to a per-node log file.
+
+## Client / CLI
+- Location: `src/ctl` and related CLI helper in the repository (e.g., a small CLI under `src/ctl` or `src/hydfs/cmd/`)
+- Responsibility: a simple REPL-style CLI that talks to the HyDFS HTTP API to create/append/get files. The CLI maps human consistency levels (one/quorum/all) to `min_replies` for quorum requests.
+
+## Quick run notes
+- The HyDFS daemon boots the HTTP API and subscribes to the membership store when available. Configurable values (HTTP bind address, file directories, replication factor) are in the repository config (see `config.json` and `src/config/config.go`).
+
+Simple example (adjust paths/config as appropriate):
+
+```powershell
+# from project root
+# cd src
+# go mod tidy
+# Run the hydfs daemon (exact package depends on layout; see src/ctl and src/hydfs/cmd)
+# Example (may need to adapt to your environment):
+go run ./src/ctl
+# or
+go run ./src/hydfs/cmd/hydfsd
+```
+
+And run the client/ctl REPL (if present) to exercise the API:
+
+```powershell
+# from project root
+go run ./src/ctl  # if the CLI entrypoint is in src/ctl
+# then in the REPL:
+# create <localfile> <HyDFSfilename> [one|quorum|all]
+# append <localfile> <HyDFSfilename> [one|quorum|all]
+# get <HyDFSfilename> <localfile> [one|quorum|all]
+```
+
+## Notes & next steps
+- The HyDFS daemon tightly integrates with the membership subsystem (it subscribes to membership updates to build the ring). If you want to run HyDFS in a single-node mode, the Daemon code detects a nil membership store and will run without ring-based replication.
+- This extended documentation is purposely concise — open the referenced files for implementation details and examples.
