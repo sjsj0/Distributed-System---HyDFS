@@ -1,4 +1,3 @@
-````markdown
 # Hybrid Distributed File System (HyDFS)
 
 ## Overview
@@ -195,11 +194,6 @@ The HTTP server (port 8080) exposes several endpoints for monitoring and control
   ```
 These endpoints allow you to query and modify the system state, view membership and suspicion lists, and control protocol settings at runtime.
 
-## Contributing
-
-Contributions are welcome!
-
-````
 
 # HyDFS: extended module overview
 
