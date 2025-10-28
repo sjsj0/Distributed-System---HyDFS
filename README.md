@@ -1,6 +1,4 @@
-# hydfs-g33
-
-Hybrid Distributed File System (HyDFS)
+# Hybrid Distributed File System (HyDFS)
 
 ## Overview
 HyDFS is a distributed systems project implementing group membership, failure detection, and gossip-based communication. The system is built in Go and designed to run across multiple virtual machines (VMs). It supports dynamic membership, failure detection using ping/ack and gossip heartbeat protocols along with piggyback dissemination of membership information.
