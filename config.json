@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "mode": "gossip",
+  "ping_every": "300ms",
+  "ping_fanout": 1,
+  "gossip_period": "300ms",
+  "gossip_fanout": 1,
+  "t_suspect": "1000ms",
+  "t_fail": "2000ms",
+  "t_cleanup": "3000ms",
+  "drop_rate_recv": 0.0
+}
