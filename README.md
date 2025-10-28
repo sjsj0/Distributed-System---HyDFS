@@ -1,9 +1,9 @@
 # hydfs-g33
 
-Distributed Group Membership (DGM) - Group 33
+Hybrid Distributed File System (HyDFS)
 
 ## Overview
-hydfs-g33 is a distributed systems project implementing group membership, failure detection, and gossip-based communication. The system is built in Go and designed to run across multiple virtual machines (VMs). It supports dynamic membership, failure detection using ping/ack and gossip heartbeat protocols along with piggyback dissemination of membership information.
+HyDFS is a distributed systems project implementing group membership, failure detection, and gossip-based communication. The system is built in Go and designed to run across multiple virtual machines (VMs). It supports dynamic membership, failure detection using ping/ack and gossip heartbeat protocols along with piggyback dissemination of membership information.
 ## Features
 * **Group Membership:** Each VM maintains a membership list and updates it using gossip/pingack protocols.
 * **Failure Detection:** Nodes periodically ping/gossip to each other and use suspicion mechanisms to detect failures.
@@ -33,7 +33,6 @@ setup/                 # Scripts for VM setup and orchestration
 
 config.json            # System configuration file
 README.md              # Project documentation
-MP2_Report_G33         # Project Report
 ```
 
 
@@ -175,13 +174,3 @@ These endpoints allow you to query and modify the system state, view membership 
 ## Contributing
 
 Contributions are welcome!
-
-## Authors & Acknowledgments
-- Group 33, Distributed Systems (CS 425), Fall 2025
-- Special thanks to course staff and contributors
-
-## License
-This project is for educational use only.
-
-## Project Status
-Actively maintained for the Fall 2025 semester.
