@@ -65,6 +65,7 @@ func (fi *fileIndex) List(r ring.TokenRange) ([]ring.FileMeta, error) {
 			out = append(out, ring.FileMeta{
 				Name:  m.FileName,
 				Token: fileToken,
+				Size:  m.FileSize,
 			})
 		}
 	}

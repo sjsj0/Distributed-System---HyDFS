@@ -9,7 +9,6 @@ import (
 	"context"
 	"hydfs-g33/config"
 	"hydfs-g33/hydfs/cmd/server"
-	"hydfs-g33/hydfs/logging"
 	"hydfs-g33/hydfs/ring"
 	"hydfs-g33/hydfs/routing"
 	"hydfs-g33/hydfs/storage"
@@ -20,7 +19,6 @@ import (
 type HyDFSDaemon struct {
 	fsPath    *storage.FSPaths
 	fileStore *storage.FileStore
-	log       *logging.Logger
 	cfg       config.Config
 
 	httpSrv *http.Server
@@ -34,13 +32,12 @@ type HyDFSDaemon struct {
 // and constructs a router (RF=3 by default).
 func Run(cfg config.Config, st *store.Store, selfNodeID nodeid.NodeID) (*HyDFSDaemon, error) {
 
-	paths, err := storage.NewFSPaths(cfg.HydfsFileDir, cfg.LocalFileDir)
+	paths, err := storage.NewFSPaths(cfg.HydfsFileDir, cfg.LocalFileDir, cfg.DatasetDir)
 	if err != nil {
 		log.Fatalf("paths: %v", err)
 	}
 
-	lg := logging.NewLogger(selfNodeID, fmt.Sprintf("%s/node.log", cfg.HydfsFileDir))
-	fs := storage.NewFileStore(paths, selfNodeID, lg)
+	fs := storage.NewFileStore(paths, selfNodeID)
 
 	// Context for background services (ring manager, shutdown)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -78,12 +75,13 @@ func Run(cfg config.Config, st *store.Store, selfNodeID nodeid.NodeID) (*HyDFSDa
 	// HTTP server
 	s := &server.HTTPServer{
 		FileStore:     fs,
-		Log:           lg,
 		SelfNodeID:    selfNodeID,
 		Router:        router,
 		HTTP:          &http.Client{Timeout: 10 * time.Second},
 		SelfClientSeq: &selfClientSeq,
 		Config:        cfg,
+		RingManager:   ringMgr,
+		FileIndex:     fileIndex,
 	}
 	mux := http.NewServeMux()
 	s.Register(mux)
@@ -97,7 +95,6 @@ func Run(cfg config.Config, st *store.Store, selfNodeID nodeid.NodeID) (*HyDFSDa
 		cfg:       cfg,
 		fsPath:    paths,
 		fileStore: fs,
-		log:       lg,
 		httpSrv:   httpSrv,
 		cancel:    cancel,
 		ringMgr:   ringMgr,
@@ -135,7 +132,5 @@ func (d *HyDFSDaemon) Close() {
 	}
 
 	// Optional: flush logs, sync storage state, etc.
-	if d.log != nil {
-		d.log.Infof("daemon closed")
-	}
+	fmt.Println("daemon closed")
 }

@@ -24,6 +24,7 @@ type Manifest struct {
 	Ops        []AppendOp `json:"ops"`         // ordered list of append operations
 	Created    time.Time  `json:"created"`     // manifest file creation time
 	LastUpdate time.Time  `json:"last_update"` // last manifest update time
+	FileSize   int64      `json:"file_size"`   // total logical file size
 }
 
 func LoadManifest(manifestFilePath string) (*Manifest, error) {

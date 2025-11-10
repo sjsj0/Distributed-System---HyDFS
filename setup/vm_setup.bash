@@ -43,15 +43,15 @@ REMOTE_SCRIPT="/home/${SSH_USER}/$(basename "$LOCAL_SCRIPT")"
 
 # Hosts (without usernames)
 hosts=(
-  "fa25-cs425-3301.cs.illinois.edu"
-  "fa25-cs425-3302.cs.illinois.edu"
-  "fa25-cs425-3303.cs.illinois.edu"
-  "fa25-cs425-3304.cs.illinois.edu"
+#  "fa25-cs425-3301.cs.illinois.edu"
+#  "fa25-cs425-3302.cs.illinois.edu"
+#  "fa25-cs425-3303.cs.illinois.edu"
+#  "fa25-cs425-3304.cs.illinois.edu"
   "fa25-cs425-3305.cs.illinois.edu"
-  "fa25-cs425-3306.cs.illinois.edu"
-  "fa25-cs425-3307.cs.illinois.edu"
-  "fa25-cs425-3308.cs.illinois.edu"
-  "fa25-cs425-3309.cs.illinois.edu"
+#  "fa25-cs425-3306.cs.illinois.edu"
+#  "fa25-cs425-3307.cs.illinois.edu"
+#  "fa25-cs425-3308.cs.illinois.edu"
+#  "fa25-cs425-3309.cs.illinois.edu"
   "fa25-cs425-3310.cs.illinois.edu"
 )
 

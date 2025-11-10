@@ -2,7 +2,6 @@ package storage
 
 import (
 	"fmt"
-	"hydfs-g33/hydfs/logging"
 	ids "hydfs-g33/hydfs/utils"
 	nodeid "hydfs-g33/membership/node"
 	"io"
@@ -34,16 +33,14 @@ type GetResult struct {
 type FileStore struct {
 	Paths  *FSPaths               // paths to data directories
 	NodeID nodeid.NodeID          // placeholder for membership integration
-	Log    *logging.Logger        // logger for operations
 	mu     sync.Mutex             // protects fileMu map
 	fileMu map[string]*sync.Mutex // fileToken -> lock
 }
 
-func NewFileStore(paths *FSPaths, nodeID nodeid.NodeID, log *logging.Logger) *FileStore {
+func NewFileStore(paths *FSPaths, nodeID nodeid.NodeID) *FileStore {
 	return &FileStore{
 		Paths:  paths,
 		NodeID: nodeID,
-		Log:    log,
 		fileMu: make(map[string]*sync.Mutex), // per file lock
 	}
 }
@@ -67,23 +64,24 @@ func (fs *FileStore) Create(fileName string, r io.Reader, clientID string, clien
 	// checks if file already exists, if so, no-op
 	ok, err := fs.Paths.FileDirsExist(fileToken)
 	if err == nil {
-		fs.Log.Done("file already exists", fileTokenStr, 0, 0)
+		fmt.Errorf("file already exists: %s", fileTokenStr)
 		return nil, os.ErrExist
 	}
 	if ok {
+		fmt.Errorf("file already exists: %s", fileTokenStr)
 		return nil, os.ErrExist
 	}
 
 	// create the file directory
 	if err := fs.Paths.CreateFileDirs(fileToken); err != nil {
-		fs.Log.Done("file dir creation failed", fileTokenStr, 0, 0)
+		fmt.Printf("error creating file dirs: %s\n", err)
 		return nil, err
 	}
 
-	fs.Log.Receive("create", fileTokenStr, "", 0)
+	fmt.Printf("create successful: %s\n", fileTokenStr)
 	manifestPath := fs.Paths.ManifestPath(fileToken) // path to manifest.json for this fileToken
 	if _, err := os.Stat(manifestPath); err == nil { // check if manifest already exists
-		fs.Log.Done("manifest file already exists", fileTokenStr, 0, 0)
+		fmt.Printf("manifest file already exists: %s\n", fileTokenStr)
 		return nil, os.ErrExist
 	}
 
@@ -105,28 +103,29 @@ func (fs *FileStore) Create(fileName string, r io.Reader, clientID string, clien
 		return nil, err
 	}
 
-	fs.Log.Done("create", fileName, res.Version, res.Bytes)
+	fmt.Printf("create successful: %s (version: %d, bytes: %d)\n", fileName, res.Version, res.Bytes)
 	return res, nil
 }
 
 func (fs *FileStore) Append(fileName string, r io.Reader, clientID string, clientSeq uint64, ts time.Time) (*FileOpResult, error) {
 	fileToken := ids.FileToken64(fileName)
 	fileTokenStr := strconv.FormatUint(fileToken, 10)
-	fs.Log.Receive("append", fileName, clientID, 0) // log the size
+	fmt.Printf("append received: %s (client: %s)\n", fileTokenStr, clientID)
 
 	// ensure dirs exist
 	ok, err := fs.Paths.FileDirsExist(fileToken)
 	if err != nil {
-		fs.Log.Done("file dir does not exist", fileTokenStr, 0, 0)
+		fmt.Printf("file dir does not exist: %s\n", fileTokenStr)
 		return nil, os.ErrNotExist
 	}
 	if !ok {
+		fmt.Printf("file does not exist: %s\n", fileTokenStr)
 		return nil, os.ErrNotExist
 	}
 
 	manifestPath := fs.Paths.ManifestPath(fileToken)
 	if _, err := os.Stat(manifestPath); err != nil { // check if manifest already exists
-		fs.Log.Done("manifest file doesn't exist", fileTokenStr, 0, 0)
+		fmt.Printf("manifest file doesn't exist: %s\n", fileTokenStr)
 		return nil, os.ErrNotExist
 	}
 
@@ -160,13 +159,14 @@ func (fs *FileStore) Append(fileName string, r io.Reader, clientID string, clien
 	}
 	m.AddOp(op)
 	m.Version++
+	m.FileSize += total
 	m.LastUpdate = time.Now()
 	m.SortOps()
 
 	if err := m.NewManifest(manifestPath); err != nil {
 		return nil, err
 	}
-	fs.Log.Done("append", fileName, m.Version, total)
+	fmt.Printf("append successful: %s (version: %d, bytes: %d)\n", fileName, m.Version, total)
 
 	return &FileOpResult{
 		FileName:  fileName,
@@ -181,14 +181,14 @@ func (fs *FileStore) Append(fileName string, r io.Reader, clientID string, clien
 }
 
 func (fs *FileStore) GetFile(fileName string, w io.Writer) (*GetResult, error) {
-	fs.Log.Receive("get", fileName, "", 0)
+	fmt.Printf("get received: %s\n", fileName)
 	fileToken := ids.FileToken64(fileName)
 	fileTokenStr := strconv.FormatUint(fileToken, 10)
 
 	// checks if file exists, if not, no-op
 	ok, err := fs.Paths.FileDirsExist(fileToken)
 	if err != nil {
-		fs.Log.Done("file dir does not exist", fileTokenStr, 0, 0)
+		fmt.Printf("file dir does not exist: %s\n", fileTokenStr)
 		return nil, os.ErrNotExist
 	}
 	if !ok {
@@ -197,7 +197,7 @@ func (fs *FileStore) GetFile(fileName string, w io.Writer) (*GetResult, error) {
 
 	manifestPath := fs.Paths.ManifestPath(fileToken) // path to manifest.json for this fileToken
 	if _, err := os.Stat(manifestPath); err != nil { // check if manifest already exists
-		fs.Log.Done("manifest file does not exist", fileTokenStr, 0, 0)
+		fmt.Printf("manifest file does not exist: %s\n", fileTokenStr)
 		return nil, os.ErrNotExist
 	}
 
@@ -218,7 +218,7 @@ func (fs *FileStore) GetFile(fileName string, w io.Writer) (*GetResult, error) {
 		}
 		total += n
 	}
-	fs.Log.Done("get", fileName, m.Version, total)
+	fmt.Printf("get successful: %s (version: %d, bytes: %d)\n", fileName, m.Version, total)
 
 	return &GetResult{
 		FileName:  fileName,
@@ -230,7 +230,7 @@ func (fs *FileStore) GetFile(fileName string, w io.Writer) (*GetResult, error) {
 
 func (fs *FileStore) GetManifest(fileName string) (*Manifest, error) {
 	fileToken := ids.FileToken64(fileName)
-	fs.Log.Receive("get manifest", fileName, "", 0)
+	fmt.Printf("get manifest received: %s\n", fileName)
 
 	manifestPath := fs.Paths.ManifestPath(fileToken)
 	m, err := LoadManifest(manifestPath)
@@ -240,13 +240,13 @@ func (fs *FileStore) GetManifest(fileName string) (*Manifest, error) {
 	if m == nil {
 		return nil, fmt.Errorf("manifest file not found: %s", fileName)
 	}
-	fs.Log.Done("get manifest", fileName, m.Version, 0)
+	fmt.Printf("get manifest successful: %s (version: %d)\n", fileName, m.Version)
 	return m, nil
 }
 
 // storage/file_store_local.go
 func (fs *FileStore) CreateLocalFile(localFileName string, r io.Reader) error {
-	fs.Log.Receive("create local file", localFileName, "", 0)
+	fmt.Printf("create local file received: %s\n", localFileName)
 	localFilePath := fs.Paths.LocalFilePath(localFileName)
 
 	// ensure parent dir exists
@@ -261,6 +261,6 @@ func (fs *FileStore) CreateLocalFile(localFileName string, r io.Reader) error {
 	defer f.Close()
 
 	n, err := io.Copy(f, r) // copy INTO the file
-	fs.Log.Done("create local file", localFileName, 0, n)
+	fmt.Printf("create local file successful: %s (bytes: %d)\n", localFileName, n)
 	return err
 }

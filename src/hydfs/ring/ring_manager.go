@@ -37,7 +37,6 @@ func NewManager(ctx context.Context, st *store.Store, rf int) *Manager {
 }
 
 // SetMover provides the HTTP mover so this node will actually push/GC on ring changes.
-// TODO: might not be needed
 func (m *Manager) SetMover(hm *HTTPMover) {
 	m.mu.Lock()
 	m.mover = hm
@@ -52,6 +51,9 @@ func (m *Manager) UpdateRingFromMembership(st *store.Store) {
 	nodes := make([]Node, 0, len(list))
 	var selfNode *Node
 	for _, e := range list {
+		if e.State == store.StateFailed || e.State == store.StateLeft {
+			continue // skip left and failed nodes
+		}
 		token := ids.NodeToken64(e.ID)
 		n := Node{NodeID: e.ID, Token: token}
 		nodes = append(nodes, n)

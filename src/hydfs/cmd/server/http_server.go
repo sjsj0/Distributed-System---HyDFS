@@ -7,12 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"hydfs-g33/config"
-	"hydfs-g33/hydfs/logging"
 	"hydfs-g33/hydfs/ring"
 	"hydfs-g33/hydfs/routing"
 	"hydfs-g33/hydfs/storage"
 	ids "hydfs-g33/hydfs/utils"
 	nodeid "hydfs-g33/membership/node"
+	generic_utils "hydfs-g33/utils"
 	"io"
 	"log"
 	"mime"
@@ -23,8 +23,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -34,12 +36,13 @@ import (
 
 type HTTPServer struct {
 	FileStore     *storage.FileStore
-	Log           *logging.Logger
 	SelfNodeID    nodeid.NodeID // e.g. "http://10.0.0.5:8080"
 	Router        *routing.Router
 	HTTP          *http.Client // reuse for fan-out; set in daemon
 	SelfClientSeq *uint64      // client sequence number for all requests from this node (monotonically increasing)
 	Config        config.Config
+	RingManager   *ring.Manager
+	FileIndex     ring.FileEnumerator
 }
 
 func (s *HTTPServer) routes(mux *http.ServeMux) {
@@ -54,14 +57,574 @@ func (s *HTTPServer) routes(mux *http.ServeMux) {
 	mux.HandleFunc("GET  /v1/replica/files/content", s.handleReplicaGet)
 	mux.HandleFunc("GET  /v1/replica/files/manifest", s.handleReplicaManifest)
 
-	// --- Health ---
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
+	// --- Internal (admin) endpoints ---
+	mux.HandleFunc("GET /v1/internal/files/fileexists", s.handleFileExists)
+	mux.HandleFunc("GET /v1/internal/files/ls", s.handleLs)
+	mux.HandleFunc("GET /v1/internal/files/liststore", s.handleListStore)
+	mux.HandleFunc("GET /v1/internal/membership/list_mem_ids", s.handleListMemIDs)
+	mux.HandleFunc("GET /v1/internal/files/getfromreplica", s.handleGetFromReplica)
+	mux.HandleFunc("POST /v1/internal/multiappend", s.handleMultiAppend)
+	mux.HandleFunc("GET /v1/internal/merge", s.handleMerge)
 }
 
 func (s *HTTPServer) Register(mux *http.ServeMux) { s.routes(mux) }
+
+// ----------------------------------------------------------
+// ------------------ INTERNAL HANDLERS ---------------------
+// ----------------------------------------------------------
+
+func (s *HTTPServer) handleFileExists(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	HyDFSfileName := q.Get("hydfs_file_name")
+	fmt.Println("\n\n Handle FileExists called with HyDFSfileName:", HyDFSfileName)
+	if HyDFSfileName == "" {
+		http.Error(w, "hydfs_file_name required", http.StatusBadRequest)
+		return
+	}
+	//check if file exists in HyDFSDir/files/<fileToken> directory
+	exists, err := s.FileStore.Paths.FileDirsExist(ids.FileToken64(HyDFSfileName))
+	if err != nil {
+		http.Error(w, "fileexists: "+err.Error(), http.StatusInternalServerError)
+	}
+	if exists {
+		w.WriteHeader(http.StatusOK)
+	}
+}
+
+func (s *HTTPServer) handleLs(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	HyDFSfileName := q.Get("hydfs_file_name")
+
+	fmt.Println("\n\n Handle LS called with HyDFSfileName:", HyDFSfileName)
+
+	if HyDFSfileName == "" {
+		http.Error(w, "hydfs_file_name required", http.StatusBadRequest)
+	}
+
+	//call replicaSet from router to get the nodes information
+	replicas := s.Router.ReplicaSet(HyDFSfileName)
+	if len(replicas) == 0 {
+		http.Error(w, "no replicas available", http.StatusServiceUnavailable)
+	}
+
+	//make an empty slice to store the replica only giving response as statusOK when file exists
+	var respReplica []ring.Node
+
+	//iterate over replicas and call handleFileExists to check if file exists on each replica, store the responses
+	for _, replica := range replicas {
+		replicaEndpoint, err := s.resolveReplicaEndpoint(replica.NodeID)
+		if err != nil {
+			http.Error(w, "resolve replica endpoint: "+err.Error(), http.StatusInternalServerError)
+		}
+		u := fmt.Sprintf("%s/v1/internal/files/fileexists?hydfs_file_name=%s", replicaEndpoint, url.QueryEscape(HyDFSfileName))
+		u = ensureHTTPBase(u)
+		fmt.Println("Replica fileexists URL:", u)
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			http.Error(w, "new req: "+err.Error(), http.StatusInternalServerError)
+		}
+		resp, err := s.HTTP.Do(req)
+		if err != nil {
+			http.Error(w, "replica fileexists: "+err.Error(), http.StatusInternalServerError)
+		}
+		defer resp.Body.Close()
+		//if resp.StatusCode != http.StatusOK {
+		//	http.Error(w, "file does not exist on replica: "+replica.NodeID.NodeIDToString(), http.StatusNotFound)
+		//}
+		if resp.StatusCode == http.StatusOK {
+			respReplica = append(respReplica, replica)
+		}
+
+	}
+
+	//get filetoken
+	fileToken := ids.FileToken64(HyDFSfileName)
+
+	//put both fileToken and replicas into a struct to send as response
+	type LsResponse struct {
+		HyDFSFileName string      `json:"hydfs_file_name"`
+		FileToken     uint64      `json:"file_token"`
+		Replicas      []ring.Node `json:"replicas"`
+	}
+	lsResp := LsResponse{
+		HyDFSFileName: HyDFSfileName,
+		FileToken:     fileToken,
+		Replicas:      respReplica,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(lsResp)
+}
+
+func (s *HTTPServer) handleListStore(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("\n\n Handle LISTSTORE called at node:", s.SelfNodeID.NodeIDToString())
+	tokenRange := ring.TokenRange{Start: 0, End: ^uint64(0)}
+	files, err := s.FileIndex.List(tokenRange)
+	selfNodeToken := ids.NodeToken64(s.SelfNodeID)
+
+	if err != nil {
+		http.Error(w, "liststore: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	type ListStoreResponse struct {
+		Files         []ring.FileMeta `json:"files"`
+		SelfNodeToken uint64          `json:"self_node_token"`
+	}
+
+	response := ListStoreResponse{
+		Files:         files,
+		SelfNodeToken: selfNodeToken,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *HTTPServer) handleListMemIDs(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("\n\n Handle LIST_MEM_IDS called at node:", s.SelfNodeID.NodeIDToString())
+
+	currentRing := s.RingManager.Ring()
+	if currentRing == nil {
+		http.Error(w, "no ring available", http.StatusServiceUnavailable)
+		return
+	}
+
+	type ListMemIDsResponse struct {
+		Nodes []ring.Node `json:"nodes"`
+	}
+
+	nodes := currentRing.Nodes()
+	// Sort nodes by Ring token
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Token < nodes[j].Token
+	})
+
+	response := ListMemIDsResponse{
+		Nodes: nodes,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *HTTPServer) handleGetFromReplica(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	vmAddress := q.Get("vm_address")
+	HyDFSfileName := q.Get("hydfs_file_name")
+	LocalFileName := q.Get("local_file_name")
+
+	fmt.Println("\n\n Handle GetFromReplica called with HyDFSfileName:", HyDFSfileName)
+	if vmAddress == "" || HyDFSfileName == "" || LocalFileName == "" {
+		http.Error(w, "missing query params: vmAddress, hydfs_file_name, local_file_name required", http.StatusBadRequest)
+		return
+	}
+
+	var (
+		bytesWritten int64
+	)
+
+	//check if vm_address is self or some other replica
+	selfCname := strings.TrimSuffix(generic_utils.ResolveDNSFromIP(s.SelfNodeID.NodeIDToString()), ".")
+	fmt.Printf("Self node CNAME: %s\n", selfCname)
+	fmt.Printf("Requested vmAddress: %s\n", vmAddress)
+
+	if vmAddress == selfCname {
+		//self node, get file locally
+		var buf bytes.Buffer
+		gr, err := s.streamLocalGet(HyDFSfileName, &buf)
+		if err != nil {
+			http.Error(w, "get local: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := s.FileStore.CreateLocalFile(LocalFileName, bytes.NewReader(buf.Bytes())); err != nil {
+			http.Error(w, "write local file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		bytesWritten = gr.Bytes
+
+	} else {
+		//remote replica, fetch file from there
+		vmAddress = vmAddress + s.Config.HydfsHTTP
+		fmt.Printf("Fetching from remote getfromreplica at address: %s\n", vmAddress)
+
+		u := fmt.Sprintf("%s/v1/replica/files/content?hydfs_file_name=%s", vmAddress, url.QueryEscape(HyDFSfileName))
+		u = ensureHTTPBase(u)
+		fmt.Println("Fetching from chosen replica URL:", u)
+
+		req, err := http.NewRequest("GET", u, nil)
+		if err != nil {
+			http.Error(w, "new req: "+err.Error(), http.StatusInternalServerError)
+		}
+		resp, err := s.HTTP.Do(req)
+		if err != nil {
+			http.Error(w, "replica get: "+err.Error(), http.StatusInternalServerError)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			http.Error(w, "replica "+vmAddress+": "+strings.TrimSpace(string(b)), resp.StatusCode)
+			return
+		}
+
+		// stream to a buffer first so we can hand bytes to createLocalFile
+		var buf bytes.Buffer
+		n, meta, err := readReplicaMultipart(resp, &buf)
+		if err != nil {
+			http.Error(w, "multipart read: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if err := s.FileStore.CreateLocalFile(LocalFileName, bytes.NewReader(buf.Bytes())); err != nil {
+			http.Error(w, "write local file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		bytesWritten = n
+		// if the replica included JSON meta, you could cross-check version if desired:
+		_ = meta // not strictly needed; we trust the quorum-selected manifest
+	}
+	// Respond with success and bytes written
+	type GetFromReplicaResponse struct {
+		HyDFSFileName string `json:"hydfs_file_name"`
+		LocalFileName string `json:"local_file_name"`
+		BytesWritten  int64  `json:"bytes_written"`
+	}
+	response := GetFromReplicaResponse{
+		HyDFSFileName: HyDFSfileName,
+		LocalFileName: LocalFileName,
+		BytesWritten:  bytesWritten,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+type MultiAppendPair struct {
+	NodeID    string `json:"node_id"`
+	LocalFile string `json:"local_file"`
+}
+
+type MultiAppendReq struct {
+	HyDFSFileName string            `json:"hydfs_file_name"`
+	Pairs         []MultiAppendPair `json:"pairs"`
+}
+
+type MultiAppendResp struct {
+	HydfsFileName string            `json:"hydfs_file_name"`
+	Accepted      int               `json:"accepted"`
+	Errors        map[int]string    `json:"errors,omitempty"` // index -> error
+	Pairs         []MultiAppendPair `json:"pairs,omitempty"`  // echoed back if accepted
+}
+
+func (s *HTTPServer) handleMultiAppend(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("\n\n Handle MULTIAPPEND called at node:", s.SelfNodeID.NodeIDToString())
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// --- parse min_replies (query) ---
+	q := r.URL.Query()
+	minStr := q.Get("min_replies")
+	if minStr == "" {
+		http.Error(w, "missing query param: min_replies required", http.StatusBadRequest)
+		return
+	}
+	minReplies := 1
+	if n, err := strconv.Atoi(minStr); err == nil && n > 0 {
+		minReplies = n
+	}
+
+	// --- decode JSON body ---
+	var req MultiAppendReq
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// --- basic validation ---
+	if strings.TrimSpace(req.HyDFSFileName) == "" {
+		http.Error(w, "hydfs_file_name required", http.StatusBadRequest)
+		return
+	}
+	if len(req.Pairs) == 0 {
+		http.Error(w, "pairs must be non-empty", http.StatusBadRequest)
+		return
+	}
+	if len(req.Pairs) > 10 {
+		http.Error(w, "too many pairs: max 10", http.StatusBadRequest)
+		return
+	}
+
+	// --- fan out to each node concurrently ---
+	var (
+		wg       sync.WaitGroup
+		mu       sync.Mutex
+		accepted int
+		errors   = make(map[int]string) // index -> error string
+	)
+	wg.Add(len(req.Pairs))
+
+	for idx, p := range req.Pairs {
+		idx, p := idx, p // capture loop vars
+		go func() {
+			defer wg.Done()
+
+			if strings.TrimSpace(p.LocalFile) == "" {
+				mu.Lock()
+				errors[idx] = "local_file is empty"
+				mu.Unlock()
+				return
+			}
+
+			replicaEndpoint := p.NodeID + s.Config.HydfsHTTP
+
+			// Build URL to that node’s user append endpoint.
+			u := fmt.Sprintf("%s/v1/user/append?hydfs_file_name=%s&local_file_name=%s&min_replies=%d",
+				replicaEndpoint,
+				url.QueryEscape(req.HyDFSFileName),
+				url.QueryEscape(p.LocalFile),
+				minReplies,
+			)
+			u = ensureHTTPBase(u)
+			fmt.Println("Multiappend → User append URL:", u)
+
+			// POST with empty body (handleUserAppend will read local_file_name on the remote FS)
+			httpReq, err := http.NewRequest(http.MethodPost, u, nil)
+			if err != nil {
+				mu.Lock()
+				errors[idx] = "new req: " + err.Error()
+				mu.Unlock()
+				return
+			}
+			httpReq.Header.Set("Content-Type", "application/octet-stream")
+
+			resp, err := s.HTTP.Do(httpReq)
+			if err != nil {
+				mu.Lock()
+				errors[idx] = err.Error()
+				mu.Unlock()
+				return
+			}
+			defer resp.Body.Close()
+
+			body, _ := io.ReadAll(resp.Body)
+
+			if resp.StatusCode != http.StatusOK {
+				b, _ := io.ReadAll(resp.Body)
+				mu.Lock()
+				errors[idx] = fmt.Sprintf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+				mu.Unlock()
+				return
+			}
+
+			// parse user-append JSON to ensure quorum was actually met
+			var ua struct {
+				Quorum   int `json:"quorum"`
+				Received []struct {
+					Status int    `json:"status"`
+					Err    string `json:"err,omitempty"`
+				} `json:"received"`
+			}
+			if err := json.Unmarshal(body, &ua); err != nil {
+				mu.Lock()
+				errors[idx] = "decode user-append: " + err.Error()
+				mu.Unlock()
+				return
+			}
+
+			ok := 0
+			for _, rcv := range ua.Received {
+				if rcv.Status == http.StatusOK {
+					ok++
+				}
+			}
+			if ok < ua.Quorum {
+				mu.Lock()
+				errors[idx] = fmt.Sprintf("append quorum not met: ok=%d quorum=%d", ok, ua.Quorum)
+				mu.Unlock()
+				return
+			}
+
+			// Success for this pair
+			mu.Lock()
+			accepted++
+			mu.Unlock()
+		}()
+	}
+
+	wg.Wait()
+
+	// --- respond with your typed MultiAppendResp ---
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(MultiAppendResp{
+		HydfsFileName: req.HyDFSFileName,
+		Accepted:      accepted,
+		Errors:        condErrors(errors),
+		Pairs:         req.Pairs, // echo original pairs (node_id + local_file)
+	})
+}
+
+// helper: omit empty "errors" in JSON (ensure nil not empty map)
+func condErrors(m map[int]string) map[int]string {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+type FileChunkDiff struct {
+	File           string              `json:"file"`
+	GlobalChunkIDs []string            `json:"global_chunk_ids"` // union across replicas
+	MissingByNode  map[string][]string `json:"missing_by_node"`  // nodeID -> missing chunkIDs
+	Errors         map[string]string   `json:"errors,omitempty"` // nodeID -> error
+}
+
+type MergeResponse struct {
+	ReplicaSets map[string][]ring.Node   `json:"replica_sets"`
+	Diffs       map[string]FileChunkDiff `json:"diffs"`
+}
+
+func chunkIDsFromManifest(m *storage.Manifest) []string {
+	if m == nil {
+		return nil
+	}
+	var ids []string
+	for _, op := range m.Ops {
+		for _, chunkID := range op.ChunkIDs {
+			ids = append(ids, string(chunkID))
+		}
+	}
+	return ids
+}
+
+func toSet(ss []string) map[string]struct{} {
+	s := make(map[string]struct{}, len(ss))
+	for _, x := range ss {
+		s[x] = struct{}{}
+	}
+	return s
+}
+
+func keys(m map[string]struct{}) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+func (s *HTTPServer) handleMerge(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("\n\n Handle MERGE called at node:", s.SelfNodeID.NodeIDToString())
+
+	// ---- 0) Parse and validate the target file name ----
+	hydfsName := r.URL.Query().Get("hydfs_file_name")
+	if hydfsName == "" {
+		http.Error(w, "merge: missing query param 'hydfs_file_name'", http.StatusBadRequest)
+		return
+	}
+
+	// ---- 1) Compute replica set for this file ----
+	replicas := s.Router.ReplicaSet(hydfsName)
+	replicaSets := map[string][]ring.Node{
+		hydfsName: replicas,
+	}
+	if len(replicas) == 0 {
+		// Return a response with empty replica set and an error for this file.
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(MergeResponse{
+			ReplicaSets: replicaSets,
+			Diffs: map[string]FileChunkDiff{
+				hydfsName: {
+					File:           hydfsName,
+					GlobalChunkIDs: nil,
+					MissingByNode:  map[string][]string{},
+					Errors:         map[string]string{"_all": "no replicas available"},
+				},
+			},
+		})
+		return
+	}
+
+	// ---- 2) Fetch manifests from all replicas for this file ----
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+
+	type manProbe struct {
+		nodeID   nodeid.NodeID
+		manifest *storage.Manifest
+		err      error
+	}
+
+	results := make(chan manProbe, len(replicas))
+	for _, rp := range replicas {
+		nodeID := rp.NodeID
+		go func(addr nodeid.NodeID) {
+			m, err := s.fetchManifest(ctx, addr, hydfsName)
+			results <- manProbe{nodeID: addr, manifest: m, err: err}
+		}(nodeID)
+	}
+
+	manByNode := make(map[string]*storage.Manifest, len(replicas))
+	errByNode := make(map[string]string)
+	for i := 0; i < len(replicas); i++ {
+		res := <-results
+		key := res.nodeID.NodeIDToString()
+		if res.err != nil {
+			errByNode[key] = res.err.Error()
+			continue
+		}
+		manByNode[key] = res.manifest
+	}
+
+	// ---- 3) Build the union of chunk IDs across all available manifests ----
+	union := make(map[string]struct{})
+	for _, m := range manByNode {
+		for _, cid := range chunkIDsFromManifest(m) {
+			union[cid] = struct{}{}
+		}
+	}
+	unionList := keys(union)
+	sort.Strings(unionList)
+
+	// ---- 4) Compute missing chunks per replica for this file ----
+	missingByNode := make(map[string][]string, len(replicas))
+	for _, rp := range replicas {
+		key := rp.NodeID.NodeIDToString()
+		m := manByNode[key]
+		if m == nil {
+			// If we couldn't get a manifest from this node, mark all union chunks as missing.
+			if len(union) > 0 {
+				missingByNode[key] = append([]string(nil), unionList...)
+			} else {
+				missingByNode[key] = nil
+			}
+			continue
+		}
+		have := toSet(chunkIDsFromManifest(m))
+		var missing []string
+		for cid := range union {
+			if _, ok := have[cid]; !ok {
+				missing = append(missing, cid)
+			}
+		}
+		sort.Strings(missing)
+		missingByNode[key] = missing
+	}
+
+	// ---- 5) Respond: replica set + per-replica missing-chunk diff for this file only ----
+	diff := FileChunkDiff{
+		File:           hydfsName,
+		GlobalChunkIDs: unionList,
+		MissingByNode:  missingByNode,
+		Errors:         errByNode,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(MergeResponse{
+		ReplicaSets: replicaSets, // { hydfsName: [...] }
+		Diffs:       map[string]FileChunkDiff{hydfsName: diff},
+	})
+}
 
 // ---------- helpers -----------
 
@@ -273,6 +836,14 @@ func (s *HTTPServer) resolveReplicaEndpoint(rp nodeid.NodeID) (string, error) {
 	return replicaEndpoint, nil
 }
 
+func fileReader(path string) (io.ReadCloser, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
 // ---------- handlers ----------
 
 // POST /v1/user/create_with_data?hydfs_file_name=...&min_replies=N
@@ -356,7 +927,7 @@ func (s *HTTPServer) handleUserCreateWithData(w http.ResponseWriter, r *http.Req
 
 			// Remote replica call
 			u := fmt.Sprintf("%s/v1/replica/create_with_data?hydfs_file_name=%s&client_id=%s&seq=%d&ts_ns=%d",
-				replicaEndpoint, url.QueryEscape(HyDFSFileName), url.QueryEscape(clientID), s.SelfClientSeq, timestamp.UnixNano())
+				replicaEndpoint, url.QueryEscape(HyDFSFileName), url.QueryEscape(clientID), *s.SelfClientSeq, timestamp.UnixNano())
 			u = ensureHTTPBase(u)
 			fmt.Println("Replica create URL:", u)
 
@@ -413,11 +984,12 @@ func (s *HTTPServer) handleUserCreateWithData(w http.ResponseWriter, r *http.Req
 	})
 }
 
-// POST /v1/user/append?hydfs_file_name=...&min_replies=N
+// POST /v1/user/append?hydfs_file_name=...&local_file_name=...&min_replies=N
 func (s *HTTPServer) handleUserAppend(w http.ResponseWriter, r *http.Request) {
 
 	q := r.URL.Query()
 	HyDFSFileName := q.Get("hydfs_file_name")
+	localFileName := q.Get("local_file_name")
 	minStr := q.Get("min_replies")
 
 	fmt.Println("\n\n Handle User APPEND called with HyDFSfileName:", HyDFSFileName, "minStr:", minStr)
@@ -427,12 +999,32 @@ func (s *HTTPServer) handleUserAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Buffer body to temp once
-	tmp, _, err := s.saveBodyToTemp(r.Body)
-	if err != nil {
-		http.Error(w, "buffer: "+err.Error(), 500)
-		return
+	var tmp string
+	var err error
+	// If local file given then read from local file system instead of request body
+	if localFileName != "" {
+		// Read from local file system
+		localFilePath := filepath.Join(s.Config.LocalFileDir, localFileName)
+		rc, err := fileReader(localFilePath)
+		if err != nil {
+			http.Error(w, "open local file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		defer rc.Close()
+		tmp, _, err = s.saveBodyToTemp(rc)
+		if err != nil {
+			http.Error(w, "buffer local file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// Buffer body to temp once
+		tmp, _, err = s.saveBodyToTemp(r.Body)
+		if err != nil {
+			http.Error(w, "buffer: "+err.Error(), 500)
+			return
+		}
 	}
+
 	defer os.Remove(tmp)
 
 	// Compute replicas
@@ -492,7 +1084,7 @@ func (s *HTTPServer) handleUserAppend(w http.ResponseWriter, r *http.Request) {
 
 			// Remote replica call
 			u := fmt.Sprintf("%s/v1/replica/append?hydfs_file_name=%s&client_id=%s&seq=%d&ts_ns=%d",
-				replicaEndpoint, url.QueryEscape(HyDFSFileName), url.QueryEscape(clientID), s.SelfClientSeq, timestamp.UnixNano())
+				replicaEndpoint, url.QueryEscape(HyDFSFileName), url.QueryEscape(clientID), *s.SelfClientSeq, timestamp.UnixNano())
 			u = ensureHTTPBase(u)
 			fmt.Println("Replica append URL:", u)
 
@@ -533,21 +1125,47 @@ func (s *HTTPServer) handleUserAppend(w http.ResponseWriter, r *http.Request) {
 		}()
 	}
 
-	// collect until quorum reached
-	results := make([]reply, 0, minReplies)
-	for i := 0; i < minReplies; i++ {
-		results = append(results, <-ch)
+	// NEW: collect ALL replies; decide success by count of 200 OK
+	received := make([]reply, 0, len(replicas))
+	okCount := 0
+	for i := 0; i < len(replicas); i++ {
+		r := <-ch
+		received = append(received, r)
+		if r.Status == http.StatusOK {
+			okCount++
+		}
 	}
 
-	// respond immediately; inflight goroutines will finish on their own
+	success := okCount >= minReplies
+
+	// Return non-200 if quorum not met; include details
+	if !success {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(struct {
 		Quorum   int     `json:"quorum"`
 		Received []reply `json:"received"`
 	}{
 		Quorum:   minReplies,
-		Received: results,
+		Received: received,
 	})
+
+	// // collect until quorum reached
+	// results := make([]reply, 0, minReplies)
+	// for i := 0; i < minReplies; i++ {
+	// 	results = append(results, <-ch)
+	// }
+
+	// // respond immediately; inflight goroutines will finish on their own
+	// w.Header().Set("Content-Type", "application/json")
+	// _ = json.NewEncoder(w).Encode(struct {
+	// 	Quorum   int     `json:"quorum"`
+	// 	Received []reply `json:"received"`
+	// }{
+	// 	Quorum:   minReplies,
+	// 	Received: results,
+	// })
 }
 
 // GET /v1/user/files/content?file_name=...&local_file_name=...&min_replies=N
@@ -934,5 +1552,5 @@ func (s *HTTPServer) handleReplicaGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.Log.Done("replica_get_multipart", fileName, res.Version, res.Bytes)
+	fmt.Printf("replica_get_multipart successful: %s (version: %d, bytes: %d)\n", fileName, res.Version, res.Bytes)
 }

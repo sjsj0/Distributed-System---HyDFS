@@ -27,6 +27,7 @@ type Config struct {
 	HydfsHTTP         string `json:"hydfs_http"`     // ":10010" or "ip:port"
 	HydfsFileDir      string `json:"hydfs_file_dir"` // directory for storing files on hydfs nodes
 	LocalFileDir      string `json:"local_file_dir"` // directory for storing local files on nodes
+	DatasetDir        string `json:"dataset_dir"`    // directory for datasets
 	ReplicationFactor int    `json:"replication"`    // replication factor for stored files
 	IsCtlClient       bool   `json:"is_ctl_client"`  // true if this node is a hydfsctl client
 
@@ -78,14 +79,15 @@ func Defaults() Config {
 		HydfsHTTP:         ":10010",
 		HydfsFileDir:      "/hydfs_file_store",
 		LocalFileDir:      "/local_file_store",
+		DatasetDir:        "/hydfs-g33/dataset",
 		ReplicationFactor: 3,
 		IsCtlClient:       false,
 
 		// ------------- Membership configuration -------------
 		// propagated
 		Version: 1,
-		Mode:    ModePingAck,
-		//Mode:      ModeGossip,
+		//Mode:    ModePingAck,
+		Mode:      ModeGossip,
 		PingEvery: 200 * time.Millisecond,
 		//AckTimeout:   250 * time.Millisecond,
 		PingFanout:   1,
@@ -219,6 +221,7 @@ func LoadFromFlags() (Config, error) {
 		def.SelfAddr = hostname + def.BindAddr
 		def.HydfsFileDir = "/home/mp3" + def.HydfsFileDir
 		def.LocalFileDir = "/home/mp3" + def.LocalFileDir
+		def.DatasetDir = "/home/mp3" + def.DatasetDir
 	}
 
 	// apply selected mode

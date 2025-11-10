@@ -201,8 +201,9 @@ func (rm *ReplicaManager) localPlanLeave(lp *LocalPlan, self Node, oldRing, newR
 
 // FileMeta represents a file owned/stored by this node (by token).
 type FileMeta struct {
-	Name  string
-	Token uint64
+	Name  string `json:"hydfs_file_name"`
+	Token uint64 `json:"file_token"`
+	Size  int64  `json:"file_size"`
 }
 
 // FileEnumerator is the minimal surface the mover needs from your storage layer.
@@ -226,23 +227,25 @@ type HTTPMover struct {
 
 // CopyRange implements the "From(self) -> To(peer)" transfer by enumerating local files in r
 // and POSTing each to peer /v1/replica/create_with_data.
-func (m *HTTPMover) CopyRange(from Node, to Node, r TokenRange) error {
+func (m *HTTPMover) CopyRange(from Node, to Node, r TokenRange) (int64, error) {
 	if m.Client == nil || m.Index == nil {
-		return fmt.Errorf("HTTPMover: missing client or index")
+		return 0, fmt.Errorf("HTTPMover: missing client or index")
 	}
 	files, err := m.Index.List(r)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	replicaEndpoint, err := m.resolveReplicaEndpoint(to.NodeID)
 	base := "http://" + replicaEndpoint
 	now := time.Now().UnixNano()
 
+	bytesSent := int64(0)
+
 	for _, f := range files {
 		rc, _, err := m.Index.Open(f.Name)
 		if err != nil {
-			return fmt.Errorf("open %s: %w", f.Name, err)
+			return bytesSent, fmt.Errorf("open %s: %w", f.Name, err)
 		}
 
 		// /v1/replica/create_with_data?file_name=...&client_id=...&seq=0&ts_ns=...
@@ -260,24 +263,26 @@ func (m *HTTPMover) CopyRange(from Node, to Node, r TokenRange) error {
 		req, err := http.NewRequest("POST", u, rc)
 		if err != nil {
 			rc.Close()
-			return err
+			return bytesSent, err
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
 
 		resp, err := m.Client.Do(req)
 		rc.Close()
 		if err != nil {
-			return fmt.Errorf("POST %s: %w", u, err)
+			return bytesSent, fmt.Errorf("POST %s: %w", u, err)
 		}
 		// 200 OK → created/updated; 409 Conflict → peer already has it (idempotent ok).
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusConflict {
 			b, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			return fmt.Errorf("peer %s: %s", to.NodeID.EP.EndpointToString(), string(b))
+			return bytesSent, fmt.Errorf("peer %s: %s", to.NodeID.EP.EndpointToString(), string(b))
 		}
 		resp.Body.Close()
+
+		bytesSent += f.Size
 	}
-	return nil
+	return bytesSent, nil
 }
 
 // DeleteRange enumerates local files in r and deletes them locally.
@@ -299,16 +304,29 @@ func (m *HTTPMover) DeleteRange(on Node, r TokenRange) error {
 
 // ExecuteLocal runs a local plan with the mover: pushes first, then GCs.
 func (rm *ReplicaManager) ExecuteLocal(mover *HTTPMover, lp LocalPlan) error {
+
+	//start timer
+	start := time.Now() // start timer
+	totalBytesSent := int64(0)
+
 	for _, p := range lp.Pushes {
-		if err := mover.CopyRange(p.From, p.To, p.Range); err != nil {
+		bytesSent, err := mover.CopyRange(p.From, p.To, p.Range)
+		if err != nil {
 			return err
 		}
+		totalBytesSent += bytesSent
 	}
 	for _, g := range lp.GCs {
 		if err := mover.DeleteRange(g.On, g.Range); err != nil {
 			return err
 		}
 	}
+
+	//stop timer
+	elapsed := time.Since(start) // get elapsed time
+	fmt.Println("Re-replication time:", elapsed)
+	fmt.Println("Total bytes sent:", totalBytesSent)
+
 	return nil
 }
 

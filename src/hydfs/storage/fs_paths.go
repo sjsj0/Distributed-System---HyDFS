@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -9,13 +10,14 @@ import (
 
 // FSPaths defines the directory layout for all stored files.
 type FSPaths struct {
-	HyDFSDir string // root directory for HyDFS data
-	FilesDir string // hyDFSDir/files/
-	LocalDir string // sibling to hyDFSDir for local files
+	HyDFSDir   string // root directory for HyDFS data
+	FilesDir   string // hyDFSDir/files/
+	LocalDir   string // sibling to hyDFSDir for local files
+	DatasetDir string // directory for datasets
 }
 
 // NewFSPaths creates the base directory and ensures the "files" folder exists.
-func NewFSPaths(hyDFSDir string, localDir string) (*FSPaths, error) {
+func NewFSPaths(hyDFSDir string, localDir string, datasetDir string) (*FSPaths, error) {
 	filesDir := filepath.Join(hyDFSDir, "files")
 
 	// Check if directories already exist, if they do, delete them and recreate else just create them
@@ -35,10 +37,16 @@ func NewFSPaths(hyDFSDir string, localDir string) (*FSPaths, error) {
 			return nil, fmt.Errorf("create dir %s: %w", dir, err)
 		}
 	}
+
+	if err := copyTxtFiles(datasetDir, localDir); err != nil {
+		return nil, fmt.Errorf("copy txt: %w", err)
+	}
+
 	return &FSPaths{
-		HyDFSDir: hyDFSDir,
-		FilesDir: filesDir,
-		LocalDir: localDir,
+		HyDFSDir:   hyDFSDir,
+		FilesDir:   filesDir,
+		LocalDir:   localDir,
+		DatasetDir: datasetDir,
 	}, nil
 }
 
@@ -99,4 +107,48 @@ func (p *FSPaths) CreateFileDirs(fileToken uint64) error {
 		}
 	}
 	return nil
+}
+
+func copyTxtFiles(srcDir, dstDir string) error {
+	entries, err := os.ReadDir(srcDir)
+	if err != nil {
+		// If datasetDir doesn't exist, just no-op.
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if filepath.Ext(name) != ".txt" {
+			continue
+		}
+		src := filepath.Join(srcDir, name)
+		dst := filepath.Join(dstDir, name)
+		if err := copyFile(src, dst); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func copyFile(src, dst string) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	out, err := os.Create(dst) // 0644
+	if err != nil {
+		return err
+	}
+	_, err = io.Copy(out, in)
+	if cerr := out.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
