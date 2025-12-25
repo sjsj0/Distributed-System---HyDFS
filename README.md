@@ -1,7 +1,7 @@
 # Hybrid Distributed File System (HyDFS)
 
 ## Overview
-hydfs-g33 is a hybrid distributed file system (HyDFS) and key-value store inspired by ideas from Cassandra (consistent-hash ring + replication) and HDFS (chunked storage with manifests). The implementation is in Go and is intended to run across multiple VMs. The project combines two coordinated subsystems:
+HyDFS is a hybrid distributed file system (HyDFS) and key-value store inspired by ideas from Cassandra (consistent-hash ring + replication) and HDFS (chunked storage with manifests). The implementation is in Go and is intended to run across multiple VMs. The project combines two coordinated subsystems:
 
 - A membership and failure-detection subsystem that provides dynamic group membership, protocol switching, and an HTTP admin interface.
 - A HyDFS storage and routing subsystem that stores logical files as manifests + chunked data, uses a consistent-hash ring for replica placement, and performs re-replication and GC when the ring changes.
